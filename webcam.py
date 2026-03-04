@@ -31,6 +31,18 @@ def overlay_rgba(background_bgr: np.ndarray, overlay_rgba: np.ndarray, x: int, y
 
     return bg
 
+class EMA: # Exponential Moving Average for smoothing values (stackoverflow)
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, x):
+        if self.value is None:
+            self.value = x
+        else:
+            self.value = self.alpha * x + (1 - self.alpha) * self.value
+        return self.value
+
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -43,11 +55,15 @@ def main():
         min_detection_confidence=0.6,
     )
     detector = vision.FaceDetector.create_from_options(options)
-    t0 = time.time()
 
     hamster = cv2.imread("assets/fish.png", cv2.IMREAD_UNCHANGED)
     if hamster is None or hamster.shape[2] != 4:
         raise RuntimeError("hamster must be a PNG with alpha (RGBA).")
+
+    # smoothing for box
+    ema_x, ema_y, ema_w, ema_h = EMA(), EMA(), EMA(), EMA()
+
+    t0 = time.time()
 
     while True:
         ok, frame_bgr = cap.read()
@@ -60,21 +76,25 @@ def main():
         ts_ms = int((time.time() - t0) * 1000) # timestamp in milliseconds
         result = detector.detect_for_video(mp_image, ts_ms)
 
-        out = frame_bgr
+        out = frame_bgr.copy()
 
         if result.detections:
-            det = result.detections[0]
+            det = max(result.detections, key=lambda d: d.categories[0].score if d.categories else 0.0)
             box = det.bounding_box
-            H, W = frame_bgr.shape[:2]
 
-            x = int(box.origin_x)
-            y = int(box.origin_y)
-            w = int(box.width)
-            h = int(box.height)
+            x = int(ema_x.update(box.origin_x))
+            y = int(ema_y.update(box.origin_y))
+            w = int(ema_w.update(box.width))
+            h = int(ema_h.update(box.height))
 
+            # scale overlay to face width
             scale = w / hamster.shape[1]
             new_w = int(hamster.shape[1] * scale)
             new_h = int(hamster.shape[0] * scale)
+
+            # clamp sizes (prevents weird extremes)
+            new_w = max(40, min(new_w, 600))
+            new_h = max(40, min(new_h, 600))
 
             resized = cv2.resize(hamster, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
@@ -99,3 +119,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
