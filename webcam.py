@@ -9,6 +9,7 @@ from mediapipe.tasks.python import vision
 
 FACE_DETECTOR_MODEL = "models/blaze_face_short_range.tflite"
 FACE_LANDMARKER_MODEL = "models/face_landmarker.task"
+HAND_LANDMARKER_MODEL = "models/hand_landmarker.task"
 
 MEME_MAP = {
     "blushing": "assets/blushing.png",
@@ -130,15 +131,61 @@ def compute_features(face_landmarks, W: int, H: int) -> dict:
     }
 
 
-def choose_meme(features: dict) -> str:
+def compute_hand_signals(hand_landmarks, face_center_y: float | None, W: int, H: int) -> dict:
+    """
+    Compute hand signals from hand landmarks.
+    Returns dict with hands_up (bool) and hand_center (x, y) in pixels.
+    """
+    # Wrist = landmark 0, Middle finger MCP = landmark 9 (rough palm center)
+    wrist = hand_landmarks[0]
+    middle_mcp = hand_landmarks[9]
+
+    hand_cx = (wrist.x + middle_mcp.x) / 2.0 * W
+    hand_cy = (wrist.y + middle_mcp.y) / 2.0 * H
+
+    hands_up = False
+    if face_center_y is not None:
+        hands_up = hand_cy < face_center_y  # hand above face center
+
+    # Open palm vs fist: compare distances between fingertips and wrist
+    # Fingertip indices: 4 (thumb), 8 (index), 12 (middle), 16 (ring), 20 (pinky)
+    fingertips = [hand_landmarks[i] for i in [4, 8, 12, 16, 20]]
+    wrist_pt = np.array([wrist.x * W, wrist.y * H])
+    tip_dists = [dist(np.array([ft.x * W, ft.y * H]), wrist_pt) for ft in fingertips]
+    avg_tip_dist = sum(tip_dists) / len(tip_dists)
+
+    # MCP indices for reference scale
+    mcp_pts = [hand_landmarks[i] for i in [5, 9, 13, 17]]
+    mcp_dists = [dist(np.array([m.x * W, m.y * H]), wrist_pt) for m in mcp_pts]
+    avg_mcp_dist = sum(mcp_dists) / len(mcp_dists) + 1e-6
+
+    open_palm = (avg_tip_dist / avg_mcp_dist) > 1.6  # fingers extended
+
+    return {
+        "hands_up": hands_up,
+        "hand_cx": hand_cx,
+        "hand_cy": hand_cy,
+        "open_palm": open_palm,
+    }
+
+
+def choose_meme(features: dict, hand_signals: dict | None = None) -> str:
     """
     Rule-based mapper from features to meme key (matches MEME_MAP keys).
-    Tune thresholds by watching live numbers on screen.
+    Hand signals can override face-based meme selection.
     """
     mouth_open = features["mouth_open"]
     smile = features["smile"]
     brow = features["brow_raise"]
     eye_open = features["eye_open"]
+
+    # Hand gesture overrides
+    if hand_signals is not None:
+        hands_up = hand_signals.get("hands_up", False)
+        open_palm = hand_signals.get("open_palm", False)
+
+        if hands_up and open_palm:
+            return "ultra_happy"
 
     if eye_open < 0.018:
         return "sleeping"
@@ -187,7 +234,6 @@ def main():
 
         MEMES[key] = img
 
-
     det_base = python.BaseOptions(model_asset_path=FACE_DETECTOR_MODEL)
     det_opts = vision.FaceDetectorOptions(
         base_options=det_base,
@@ -205,6 +251,18 @@ def main():
         output_facial_transformation_matrixes=False,
     )
     face_landmarker = vision.FaceLandmarker.create_from_options(lm_opts)
+
+    # Hand landmarker
+    hand_base = python.BaseOptions(model_asset_path=HAND_LANDMARKER_MODEL)
+    hand_opts = vision.HandLandmarkerOptions(
+        base_options=hand_base,
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    hand_landmarker = vision.HandLandmarker.create_from_options(hand_opts)
 
     ema_x, ema_y, ema_w, ema_h = EMA(0.35), EMA(0.35), EMA(0.35), EMA(0.35)
     ema_mouth = EMA(0.25)
@@ -225,14 +283,16 @@ def main():
 
         ts_ms = int((time.time() - t0) * 1000)
 
-        #both mnodels
+        # All three models
         det_res = face_detector.detect_for_video(mp_image, ts_ms)
         lm_res = face_landmarker.detect_for_video(mp_image, ts_ms)
+        hand_res = hand_landmarker.detect_for_video(mp_image, ts_ms)
 
         out = frame_bgr.copy()
 
         meme_key = "neutral"
         features_smoothed = None
+        face_center_y = None
 
         if lm_res.face_landmarks:
             feats = compute_features(lm_res.face_landmarks[0], W=W, H=H)
@@ -243,7 +303,33 @@ def main():
             feats["eye_open"] = ema_eye.update(feats["eye_open"])
             features_smoothed = feats
 
-            meme_key = choose_meme(feats)
+            # Compute face center Y for hands_up detection
+            nose_tip = lm_res.face_landmarks[0][1]  # landmark 1 = nose tip
+            face_center_y = nose_tip.y * H
+
+        # Hand signals
+        hand_signals = None
+        num_hands = 0
+        if hand_res.hand_landmarks:
+            num_hands = len(hand_res.hand_landmarks)
+            # Use the first detected hand for signals
+            h_sigs = compute_hand_signals(hand_res.hand_landmarks[0], face_center_y, W, H)
+
+            hand_signals = h_sigs
+
+            # Draw hand landmarks for debug
+            for hand_lms in hand_res.hand_landmarks:
+                for lm in hand_lms:
+                    px, py = int(lm.x * W), int(lm.y * H)
+                    cv2.circle(out, (px, py), 3, (255, 0, 255), -1)
+
+        # Choose meme (face features + hand signals)
+        if features_smoothed is not None:
+            meme_key = choose_meme(features_smoothed, hand_signals)
+        elif hand_signals is not None:
+            # No face but hand detected – use default features with hand override
+            default_feats = {"mouth_open": 0, "smile": 0.35, "brow_raise": 0.05, "eye_open": 0.03}
+            meme_key = choose_meme(default_feats, hand_signals)
 
         # Bounding box (anchor overlay) - use most confident detection
         if det_res.detections:
@@ -265,6 +351,9 @@ def main():
             new_h = clamp(new_h, 40, 700)
 
             resized = cv2.resize(meme_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Stabilize meme selection (majority vote + hold time)
+        meme_key = meme_stabilizer.update(meme_key)
 
             # above head
             hx = x + w // 2 - new_w // 2
@@ -288,8 +377,18 @@ def main():
             cv2.putText(out, f"eye_open:  {features_smoothed['eye_open']:.3f}", (20, 135),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
         else:
-            cv2.putText(out, "Nothign detected", (20, 60),
+            cv2.putText(out, "Nothing detected", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        # Hand debug info
+        hand_y = 165
+        cv2.putText(out, f"hands: {num_hands}", (20, hand_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+        if hand_signals is not None:
+            cv2.putText(out, f"hands_up:  {hand_signals['hands_up']}", (20, hand_y + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+            cv2.putText(out, f"open_palm: {hand_signals['open_palm']}", (20, hand_y + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
 
         cv2.imshow("mimics-memefied", out)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -301,3 +400,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
