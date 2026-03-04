@@ -50,6 +50,10 @@
     "min_size": 40,
     "max_size": 700,
     "y_offset": -10
+  },
+
+  "display": {
+    "default_mode": "debug",
+    "modes": ["overlay", "debug", "split", "none"]
   }
 }
-
