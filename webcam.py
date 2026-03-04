@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from PIL import Image
+from collections import deque, Counter
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -37,6 +38,25 @@ class EMA:
         else:
             self.value = self.alpha * x + (1 - self.alpha) * self.value
         return self.value
+
+
+class MemeStabilizer:
+    """Majority-vote + hold-time filter to prevent meme flicker."""
+    def __init__(self, window=12, hold_ms=450):
+        self.window = deque(maxlen=window)
+        self.hold_ms = hold_ms
+        self.current = "neutral"
+        self.last_switch = 0.0
+
+    def update(self, candidate: str) -> str:
+        self.window.append(candidate)
+        most_common = Counter(self.window).most_common(1)[0][0]
+
+        now = time.time() * 1000
+        if most_common != self.current and (now - self.last_switch) >= self.hold_ms:
+            self.current = most_common
+            self.last_switch = now
+        return self.current
 
 
 def dist(a: np.ndarray, b: np.ndarray) -> float:
@@ -270,6 +290,8 @@ def main():
     ema_brow = EMA(0.25)
     ema_eye = EMA(0.25)
 
+    meme_stabilizer = MemeStabilizer(window=12, hold_ms=450)
+
     t0 = time.time()
 
     while True:
@@ -331,6 +353,9 @@ def main():
             default_feats = {"mouth_open": 0, "smile": 0.35, "brow_raise": 0.05, "eye_open": 0.03}
             meme_key = choose_meme(default_feats, hand_signals)
 
+        # Stabilize meme selection (majority vote + hold time)
+        meme_key = meme_stabilizer.update(meme_key)
+
         # Bounding box (anchor overlay) - use most confident detection
         if det_res.detections:
             det = max(det_res.detections, key=lambda d: d.categories[0].score if d.categories else 0.0)
@@ -351,9 +376,6 @@ def main():
             new_h = clamp(new_h, 40, 700)
 
             resized = cv2.resize(meme_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-        # Stabilize meme selection (majority vote + hold time)
-        meme_key = meme_stabilizer.update(meme_key)
 
             # above head
             hx = x + w // 2 - new_w // 2
